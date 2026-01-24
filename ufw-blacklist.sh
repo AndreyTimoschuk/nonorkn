@@ -1,137 +1,158 @@
 #!/bin/bash
+
 # =============================================================================
-# UFW Blacklist Script - Block scanner/malicious networks using ipset
+# UFW + IPSET Blacklist - Block unwanted networks
 # https://github.com/AndreyTimoschuk/nonorkn
 # =============================================================================
-# Version: 1.0.0
-# License: MIT
-# =============================================================================
-
-set -euo pipefail
-
-# =============================================================================
-# CONFIGURATION - Edit these values as needed
-# =============================================================================
-
-# Blacklist source (Russian government networks)
+# Integrates with UFW via /etc/ufw/before.rules
 # Source: https://github.com/C24Be/AS_Network_List
-BLACKLIST_URL="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt"
+# =============================================================================
 
-# ipset names
-IPSET_BLACKLIST="blacklist"
-IPSET_WHITELIST="whitelist"
+# === QUICK DIAGNOSTICS ===
+# 1. Check ipset sets
+# ipset list whitelist | head -5
+# ipset list blacklist | head -5
+# echo "Whitelist: $(ipset list whitelist | grep -c '^[0-9]') | Blacklist: $(ipset list blacklist | grep -c '^[0-9]')"
+#
+# 2. Check rules in UFW before.rules
+# grep -A5 "IPSET BLACKLIST" /etc/ufw/before.rules
+#
+# 3. Check iptables rules (order matters!)
+# iptables -L ufw-before-input -v -n --line-numbers | head -10
+#
+# 4. Check specific IP
+# ipset test whitelist 1.2.3.4
+# ipset test blacklist 1.2.3.4
+#
+# 5. Check systemd service
+# systemctl status ipset-load.service
+#
+# 6. View recent blocks
+# tail -20 /var/log/ufw.log | grep BLOCK
+#
+# 7. Check ipset persistence
+# ls -lh /etc/ipset.rules
+#
+# 8. UFW status
+# ufw status verbose | head -5
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Blacklist URL (Russian government networks)
+URL="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt"
 
 # Paths
-LOG_FILE="/var/log/ufw_blacklist.log"
-IPSET_SAVE_FILE="/etc/ipset.rules"
 TEMP_FILE="/tmp/blacklist_subnets.txt"
+LOG_FILE="/var/log/ufw_blacklist.log"
+IPSET_BLACKLIST="blacklist"
+IPSET_WHITELIST="whitelist"
+IPSET_SAVE_FILE="/etc/ipset.rules"
+IPSET_LOAD_SCRIPT="/usr/local/bin/load-ipset-blacklist.sh"
 
-# Whitelist IPs - add your trusted IPs here (servers, VPN endpoints, etc.)
-# These IPs will NEVER be blocked even if they appear in blacklist
+# =============================================================================
+# WHITELIST - IPs that should ALWAYS be allowed
+# Add your trusted IPs here (home IP, office, VPN servers, etc.)
+# =============================================================================
 WHITELIST_IPS=(
     # Example: "1.2.3.4"
     # Example: "10.0.0.0/8"
 )
 
-# =============================================================================
-# FUNCTIONS
-# =============================================================================
+# Check root
+[[ $EUID -ne 0 ]] && { echo "Error: must be run as root (sudo)" | tee -a "$LOG_FILE"; exit 1; }
 
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S'): $*" | tee -a "$LOG_FILE"
-}
-
-# Check and install required packages
+# Install required packages
 install_packages() {
-    local packages_to_install=()
+    echo "Checking required packages..." | tee -a "$LOG_FILE"
     
     if ! command -v ipset &> /dev/null; then
-        packages_to_install+=("ipset")
-    fi
-    
-    if ! command -v curl &> /dev/null; then
-        packages_to_install+=("curl")
-    fi
-    
-    if [[ ${#packages_to_install[@]} -gt 0 ]]; then
-        log "Installing required packages: ${packages_to_install[*]}"
-        apt-get update -qq
-        apt-get install -y -qq "${packages_to_install[@]}"
+        echo "Installing ipset..." | tee -a "$LOG_FILE"
+        apt-get update >> "$LOG_FILE" 2>&1
+        apt-get install -y ipset >> "$LOG_FILE" 2>&1
     fi
 }
 
 # Create ipset sets
 create_ipsets() {
-    log "Creating ipset sets..."
+    echo "Creating ipset sets..." | tee -a "$LOG_FILE"
     
-    # Destroy old sets if exist
-    ipset destroy "$IPSET_BLACKLIST" 2>/dev/null || true
-    ipset destroy "$IPSET_WHITELIST" 2>/dev/null || true
+    # Create sets if not exist (|| true ignores "already exists" error)
+    ipset create "$IPSET_WHITELIST" hash:net family inet hashsize 1024 maxelem 65536 2>/dev/null || true
+    ipset create "$IPSET_BLACKLIST" hash:net family inet hashsize 65536 maxelem 1000000 2>/dev/null || true
     
-    # Create new sets (hash:net for subnets)
-    ipset create "$IPSET_BLACKLIST" hash:net maxelem 131072 -exist
-    ipset create "$IPSET_WHITELIST" hash:net maxelem 65536 -exist
-    
-    log "ipset sets created: $IPSET_BLACKLIST, $IPSET_WHITELIST"
+    echo "ipset sets created/verified" | tee -a "$LOG_FILE"
 }
 
 # Apply whitelist IPs
 apply_whitelist() {
-    log "Applying whitelist..."
+    echo "Applying whitelist IPs..." | tee -a "$LOG_FILE"
     
-    ipset flush "$IPSET_WHITELIST" 2>/dev/null || true
+    local added_count=0
     
-    local count=0
+    # Flush whitelist
+    ipset flush "$IPSET_WHITELIST" 2>/dev/null
+    
     for ip in "${WHITELIST_IPS[@]}"; do
-        if [[ -n "$ip" && ! "$ip" =~ ^# ]]; then
-            ipset add "$IPSET_WHITELIST" "$ip" -exist 2>/dev/null && ((count++)) || true
+        [[ -z "$ip" ]] && continue
+        
+        if ipset add "$IPSET_WHITELIST" "$ip" 2>/dev/null; then
+            ((added_count++))
         fi
     done
     
-    log "Whitelist applied: $count IPs"
+    echo "Whitelist: added $added_count IPs" | tee -a "$LOG_FILE"
 }
 
 # Download and apply blacklist
 apply_blacklist() {
-    log "Downloading blacklist from $BLACKLIST_URL..."
+    echo "Downloading blacklist..." | tee -a "$LOG_FILE"
     
-    if ! curl -sf --connect-timeout 30 --max-time 120 "$BLACKLIST_URL" -o "$TEMP_FILE"; then
-        log "ERROR: Failed to download blacklist"
-        return 1
+    if ! curl -s --connect-timeout 10 --max-time 60 --retry 3 "$URL" -o "$TEMP_FILE" 2>> "$LOG_FILE"; then
+        echo "Error: failed to download blacklist" | tee -a "$LOG_FILE"
+        exit 1
     fi
     
-    # Filter valid subnets (IPv4 CIDR notation)
-    local valid_subnets_file="/tmp/valid_subnets.txt"
-    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "$TEMP_FILE" | \
-        grep -v '^#' | \
-        sort -u > "$valid_subnets_file"
+    [[ ! -s "$TEMP_FILE" ]] && { echo "Error: downloaded file is empty" | tee -a "$LOG_FILE"; exit 1; }
+
+    echo "Validating subnets..." | tee -a "$LOG_FILE"
+    local valid_subnets_file="/tmp/blacklist_valid.txt"
     
-    local subnet_count
-    subnet_count=$(wc -l < "$valid_subnets_file")
-    log "Valid subnets found: $subnet_count"
+    # Filter valid IPv4 subnets
+    grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "$TEMP_FILE" | sort -u > "$valid_subnets_file"
     
-    # Flush and reload blacklist using ipset restore (fast)
-    ipset flush "$IPSET_BLACKLIST" 2>/dev/null || true
+    local total=$(wc -l < "$valid_subnets_file")
+    [[ "$total" -eq 0 ]] && { echo "Error: no valid subnets found" | tee -a "$LOG_FILE"; exit 1; }
     
+    echo "Found $total valid subnets" | tee -a "$LOG_FILE"
+    
+    # Flush blacklist
+    ipset flush "$IPSET_BLACKLIST" 2>/dev/null
+    
+    # Create restore file
+    echo "Loading subnets into ipset..." | tee -a "$LOG_FILE"
     local restore_file="/tmp/ipset_restore.txt"
-    echo "create $IPSET_BLACKLIST hash:net maxelem 131072 -exist" > "$restore_file"
+    > "$restore_file"
+    
     while IFS= read -r subnet; do
-        echo "add $IPSET_BLACKLIST $subnet -exist" >> "$restore_file"
+        [[ -z "$subnet" ]] && continue
+        echo "add $IPSET_BLACKLIST $subnet" >> "$restore_file"
     done < "$valid_subnets_file"
     
-    if ipset restore < "$restore_file" 2>/dev/null; then
-        log "Blacklist applied successfully: $subnet_count subnets"
+    # Load all rules at once (-! ignores duplicates)
+    if ipset restore -! < "$restore_file" 2>> "$LOG_FILE"; then
+        echo "Blacklist: loaded $total subnets" | tee -a "$LOG_FILE"
     else
-        log "ERROR: Failed to restore ipset"
-        return 1
+        echo "Warning: some subnets failed to load (see log)" | tee -a "$LOG_FILE"
     fi
     
     rm -f "$restore_file" "$valid_subnets_file"
 }
 
-# Integrate ipset with UFW
+# Integrate with UFW via before.rules
 integrate_with_ufw() {
-    log "Integrating with UFW..."
+    echo "Integrating with UFW..." | tee -a "$LOG_FILE"
     
     local before_rules="/etc/ufw/before.rules"
     local marker_start="# BEGIN IPSET BLACKLIST"
@@ -139,13 +160,16 @@ integrate_with_ufw() {
     local tmp_rules="/tmp/ipset_ufw_rules.txt"
     
     if [[ ! -f "$before_rules" ]]; then
-        log "ERROR: $before_rules not found. Is UFW installed?"
+        echo "Error: $before_rules not found. Is UFW installed?" | tee -a "$LOG_FILE"
         return 1
     fi
     
+    # Remove diagnostic logging rules if any
+    iptables -D ufw-before-input -m set --match-set "$IPSET_BLACKLIST" src -j LOG --log-prefix "[BLACKLIST-BLOCK] " --log-level 4 2>/dev/null
+    
     # Remove old ipset rules
     if grep -q "$marker_start" "$before_rules"; then
-        log "Removing old ipset rules..."
+        echo "Removing old ipset rules..." | tee -a "$LOG_FILE"
         sed -i "/$marker_start/,/$marker_end/d" "$before_rules"
     fi
     
@@ -153,46 +177,57 @@ integrate_with_ufw() {
     # Order matters:
     # 1. ESTABLISHED,RELATED - allow responses to OUR outgoing connections
     # 2. Whitelist - allow trusted IPs
-    # 3. Blacklist - block bad IPs (only NEW incoming connections)
+    # 3. Blacklist - block bad IPs (only NEW connections)
     cat > "$tmp_rules" << EOF
 
 $marker_start
-# Allow responses to our outgoing connections (important for APIs, updates, etc.)
+# ESTABLISHED/RELATED - allow responses to our outgoing connections
+# This allows connecting TO servers in blacklist (APIs, CDNs, etc.)
 -A ufw-before-input -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-# Whitelist - trusted IPs bypass blacklist
+# Whitelist - allow trusted IPs (before blacklist!)
 -A ufw-before-input -m set --match-set $IPSET_WHITELIST src -j ACCEPT
-# Blacklist - block malicious networks
+# Blacklist - block NEW incoming connections from blacklist
 -A ufw-before-input -m set --match-set $IPSET_BLACKLIST src -j DROP
 $marker_end
 EOF
     
-    # Insert after "# End required lines" or after :ufw-before-input
+    # Insert rules after "# End required lines"
     if grep -q "# End required lines" "$before_rules"; then
         sed -i "/# End required lines/r $tmp_rules" "$before_rules"
-        log "Rules added after '# End required lines'"
+        echo "Rules added after '# End required lines'" | tee -a "$LOG_FILE"
     else
         sed -i "/:ufw-before-input/r $tmp_rules" "$before_rules"
-        log "Rules added after :ufw-before-input"
+        echo "Rules added after :ufw-before-input" | tee -a "$LOG_FILE"
     fi
     
     rm -f "$tmp_rules"
     
     if grep -q "$marker_start" "$before_rules"; then
-        log "UFW integration successful"
+        echo "UFW integration successful" | tee -a "$LOG_FILE"
     else
-        log "ERROR: UFW integration failed"
+        echo "ERROR: UFW integration failed!" | tee -a "$LOG_FILE"
         return 1
     fi
 }
 
-# Save ipset for persistence across reboots
+# Save ipset for persistence
 save_ipset() {
-    log "Saving ipset rules for persistence..."
+    echo "Saving ipset for persistence..." | tee -a "$LOG_FILE"
     
+    # Save current ipset
     ipset save > "$IPSET_SAVE_FILE" 2>/dev/null
     
-    # Create systemd service for loading ipset at boot
-    cat > /etc/systemd/system/ipset-load.service << 'EOF'
+    # Create load script
+    cat > "$IPSET_LOAD_SCRIPT" << 'LOADSCRIPT'
+#!/bin/bash
+# Load ipset at system startup
+IPSET_SAVE_FILE="/etc/ipset.rules"
+[[ -f "$IPSET_SAVE_FILE" ]] && ipset restore < "$IPSET_SAVE_FILE"
+LOADSCRIPT
+    chmod +x "$IPSET_LOAD_SCRIPT"
+    
+    # Create systemd service to load ipset before UFW
+    cat > /etc/systemd/system/ipset-load.service << 'SERVICEEOF'
 [Unit]
 Description=Load ipset rules
 Before=ufw.service
@@ -200,65 +235,58 @@ After=network-pre.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '[[ -f /etc/ipset.rules ]] && /sbin/ipset restore < /etc/ipset.rules'
+ExecStart=/usr/local/bin/load-ipset-blacklist.sh
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
+SERVICEEOF
     
     systemctl daemon-reload
-    systemctl enable ipset-load.service 2>/dev/null
+    systemctl enable ipset-load.service >> "$LOG_FILE" 2>&1
     
-    log "ipset persistence configured"
+    echo "Persistence configured" | tee -a "$LOG_FILE"
 }
 
 # Reload UFW
 reload_ufw() {
-    log "Reloading UFW..."
-    
-    if ufw reload 2>/dev/null; then
-        log "UFW reloaded successfully"
-    else
-        log "WARNING: UFW reload failed (maybe UFW is disabled?)"
-    fi
+    echo "Reloading UFW..." | tee -a "$LOG_FILE"
+    ufw reload >> "$LOG_FILE" 2>&1
+    echo "UFW reloaded" | tee -a "$LOG_FILE"
 }
 
 # Show statistics
 show_stats() {
-    echo ""
-    echo "=========================================="
-    echo "           BLACKLIST STATISTICS"
-    echo "=========================================="
-    echo "Blacklist entries: $(ipset list "$IPSET_BLACKLIST" 2>/dev/null | grep -c "^[0-9]" || echo 0)"
-    echo "Whitelist entries: $(ipset list "$IPSET_WHITELIST" 2>/dev/null | grep -c "^[0-9]" || echo 0)"
-    echo "Log file: $LOG_FILE"
-    echo "=========================================="
+    echo "" | tee -a "$LOG_FILE"
+    echo "=== Statistics ===" | tee -a "$LOG_FILE"
+    echo "Whitelist IPs: $(ipset list "$IPSET_WHITELIST" 2>/dev/null | grep -c '^[0-9]' || echo 0)" | tee -a "$LOG_FILE"
+    echo "Blacklist subnets: $(ipset list "$IPSET_BLACKLIST" 2>/dev/null | grep -c '^[0-9]' || echo 0)" | tee -a "$LOG_FILE"
+    
+    if [[ ${#WHITELIST_IPS[@]} -gt 0 ]]; then
+        echo "" | tee -a "$LOG_FILE"
+        echo "=== Whitelist IPs ===" | tee -a "$LOG_FILE"
+        ipset list "$IPSET_WHITELIST" 2>/dev/null | grep '^[0-9]' | tee -a "$LOG_FILE"
+    fi
+    
+    echo "" | tee -a "$LOG_FILE"
+    echo "=== UFW before.rules check ===" | tee -a "$LOG_FILE"
+    grep -A5 "BEGIN IPSET BLACKLIST" /etc/ufw/before.rules 2>/dev/null | tee -a "$LOG_FILE"
 }
 
 # =============================================================================
 # MAIN
 # =============================================================================
-
-# Check if running as root
-if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: This script must be run as root"
-    exit 1
-fi
-
-log "=========================================="
-log "Starting UFW Blacklist update"
-log "=========================================="
+echo "========================================" >> "$LOG_FILE"
+echo "UFW + IPSET Blacklist started $(date)" | tee -a "$LOG_FILE"
 
 install_packages
 create_ipsets
-apply_blacklist
-apply_whitelist
-integrate_with_ufw
-save_ipset
-reload_ufw
+apply_blacklist      # First load blacklist
+apply_whitelist      # Then whitelist
+integrate_with_ufw   # Integrate with UFW (whitelist BEFORE blacklist)
+save_ipset           # Save for persistence
+reload_ufw           # Reload UFW
 show_stats
 
 rm -f "$TEMP_FILE"
-
-log "UFW Blacklist update completed"
+echo "Script completed successfully $(date)" | tee -a "$LOG_FILE"
