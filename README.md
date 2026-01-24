@@ -143,13 +143,16 @@ UFW управляет iptables через конфигурационные фа
 
 ---
 
-## Установка
+## Установка и запуск
 
-### Быстрая установка (одна команда):
+> **Все команды выполняются от root** (`sudo su` или `sudo bash`)
+
+### Быстрая установка + запуск (одна команда):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AndreyTimoschuk/nonorkn/main/ufw-blacklist.sh -o /usr/local/bin/ufw-blacklist.sh && \
-chmod +x /usr/local/bin/ufw-blacklist.sh
+chmod +x /usr/local/bin/ufw-blacklist.sh && \
+/usr/local/bin/ufw-blacklist.sh
 ```
 
 ### Или пошагово:
@@ -161,30 +164,24 @@ curl -fsSL https://raw.githubusercontent.com/AndreyTimoschuk/nonorkn/main/ufw-bl
 # 2. Сделать исполняемым
 chmod +x /usr/local/bin/ufw-blacklist.sh
 
-# 3. (ВАЖНО!) Отредактировать whitelist - добавить свои IP
+# 3. (Опционально) Отредактировать whitelist - добавить свои IP
 nano /usr/local/bin/ufw-blacklist.sh
+
+# 4. Запустить
+/usr/local/bin/ufw-blacklist.sh
 ```
 
 ---
 
-## Настройка Whitelist
+## Настройка Whitelist (опционально)
 
-**Перед первым запуском** откройте скрипт и добавьте свои IP-адреса в массив `WHITELIST_IPS`:
+Если нужно добавить доверенные IP которые никогда не будут заблокированы, откройте скрипт:
 
 ```bash
 nano /usr/local/bin/ufw-blacklist.sh
 ```
 
-Найдите секцию:
-
-```bash
-WHITELIST_IPS=(
-    # Example: "1.2.3.4"
-    # Example: "10.0.0.0/8"
-)
-```
-
-Добавьте свои IP:
+Найдите секцию `WHITELIST_IPS` и добавьте свои IP:
 
 ```bash
 WHITELIST_IPS=(
@@ -196,19 +193,7 @@ WHITELIST_IPS=(
 
 ---
 
-## Использование
-
-### Первый запуск:
-
-```bash
-# Убедитесь что UFW включен
-ufw enable
-
-# Запустите скрипт
-/usr/local/bin/ufw-blacklist.sh
-```
-
-### Добавить в cron (автообновление каждые 12 часов):
+## Автообновление (cron)
 
 ```bash
 # Открыть crontab
