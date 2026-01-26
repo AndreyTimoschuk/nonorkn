@@ -1,6 +1,6 @@
-# UFW Blacklist Script
+# UFW Multi-Level Blacklist Script
 
-Скрипт для автоматической блокировки нежелательных подсетей на серверах с UFW.
+Скрипт для автоматической **многоуровневой** блокировки нежелательных подсетей на серверах с UFW.
 
 ---
 
@@ -25,15 +25,26 @@
 
 ## Описание
 
-Скрипт использует связку **ipset + UFW** для блокировки тысяч подсетей без существенного влияния на производительность сервера.
+Скрипт использует связку **ipset + UFW** для многоуровневой блокировки сетей без существенного влияния на производительность сервера.
 
-### Что делает скрипт:
+### Два уровня блокировки:
 
-1. Скачивает актуальный список подсетей из [C24Be/AS_Network_List](https://github.com/C24Be/AS_Network_List)
-2. Создаёт ipset наборы для blacklist и whitelist
-3. Интегрирует ipset с UFW через `/etc/ufw/before.rules`
-4. Настраивает автозагрузку правил при перезагрузке сервера
-5. Сохраняет ответные пакеты на исходящие соединения (ESTABLISHED,RELATED)
+| Уровень | ipset | Блокировка | Описание |
+|---------|-------|------------|----------|
+| **Dangerous** | `blacklist_dangerous` | INPUT + OUTPUT + ESTABLISHED | Ботнеты, малварь, Tor, спамеры — полная изоляция |
+| **RU** | `blacklist_ru` | Только INPUT | Российские госструктуры — блок входящих, исходящие разрешены |
+
+### Источники списков:
+
+- **Dangerous** — [FireHOL blocklist-ipsets](https://github.com/firehol/blocklist-ipsets):
+  - `spamhaus_drop.netset` — hijacked networks, professional spam/cybercrime
+  - `spamhaus_edrop.netset` — extended DROP list
+  - `blocklist_de.ipset` — brute force attacks (last 48h)
+  - `feodo.ipset` — banking trojans (Emotet, Dridex)
+  - `tor_exits.ipset` — TOR exit nodes
+  - `dshield.netset` — top attacking subnets
+
+- **RU** — [C24Be/AS_Network_List](https://github.com/C24Be/AS_Network_List) — подсети российских госструктур
 
 ---
 
@@ -50,96 +61,58 @@
 ┌─────────────────────────────────────────────────────────────────┐
 │                    ЯДРО LINUX (netfilter)                       │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │                      iptables                              │  │
-│  │  ┌─────────────────────────────────────────────────────┐  │  │
-│  │  │              ufw-before-input chain                  │  │  │
-│  │  │                                                      │  │  │
-│  │  │  1. ESTABLISHED,RELATED → ACCEPT (ответы на НАШИ    │  │  │
-│  │  │     исходящие соединения проходят)                   │  │  │
-│  │  │                                                      │  │  │
-│  │  │  2. ipset whitelist → ACCEPT (доверенные IP)        │  │  │
-│  │  │                        ↓                             │  │  │
-│  │  │                   ┌─────────┐                        │  │  │
-│  │  │                   │ ipset   │ ← O(1) lookup!        │  │  │
-│  │  │                   │whitelist│   (hash table)        │  │  │
-│  │  │                   └─────────┘                        │  │  │
-│  │  │                                                      │  │  │
-│  │  │  3. ipset blacklist → DROP (блокируем)              │  │  │
-│  │  │                        ↓                             │  │  │
-│  │  │                   ┌─────────┐                        │  │  │
-│  │  │                   │ ipset   │ ← O(1) lookup!        │  │  │
-│  │  │                   │blacklist│   (3000+ подсетей)    │  │  │
-│  │  │                   └─────────┘                        │  │  │
-│  │  │                                                      │  │  │
-│  │  └─────────────────────────────────────────────────────┘  │  │
-│  │                          │                                 │  │
-│  │                          ▼                                 │  │
-│  │  ┌─────────────────────────────────────────────────────┐  │  │
-│  │  │              ufw-user-input chain                    │  │  │
-│  │  │         (ваши правила: ufw allow 22/tcp и т.д.)     │  │  │
-│  │  └─────────────────────────────────────────────────────┘  │  │
+│  │              ufw-before-input chain                        │  │
+│  │                                                            │  │
+│  │  1. WHITELIST (src) ────────────────────→ ACCEPT          │  │
+│  │                                                            │  │
+│  │  2. DANGEROUS (src) ────────────────────→ DROP            │  │
+│  │     ↑ БЛОК ДО ESTABLISHED! Даже ответы блокируются        │  │
+│  │                                                            │  │
+│  │  3. ESTABLISHED,RELATED ────────────────→ ACCEPT          │  │
+│  │     ↑ Только для НЕ-dangerous IP                          │  │
+│  │                                                            │  │
+│  │  4. RU BLACKLIST (src) ─────────────────→ DROP            │  │
+│  │     ↑ Только новые входящие (исходящие разрешены)         │  │
+│  │                                                            │  │
+│  │  5. UFW user rules (ufw allow 22/tcp и т.д.)              │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │              ufw-before-output chain                       │  │
+│  │                                                            │  │
+│  │  1. WHITELIST (dst) ────────────────────→ ACCEPT          │  │
+│  │                                                            │  │
+│  │  2. DANGEROUS (dst) ────────────────────→ DROP            │  │
+│  │     ↑ Сервер НЕ МОЖЕТ подключаться к ботнетам!            │  │
+│  │                                                            │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                        ПРИЛОЖЕНИЕ
 ```
 
 ### Почему ipset, а не обычные правила iptables/UFW?
 
-| Подход | 3000 подсетей | Сложность поиска | RAM |
-|--------|---------------|------------------|-----|
-| `ufw deny from X.X.X.X` × 3000 | 3000 правил iptables | O(n) — линейный перебор | ~150 MB |
-| `ipset` + 1 правило iptables | 1 правило + hash table | **O(1)** — мгновенно | ~1 MB |
+| Подход | 50,000 подсетей | Сложность поиска | RAM |
+|--------|-----------------|------------------|-----|
+| `ufw deny from X.X.X.X` × 50000 | 50000 правил iptables | O(n) — линейный перебор | ~2 GB |
+| `ipset` + 2 правила iptables | 2 правила + hash table | **O(1)** — мгновенно | ~5 MB |
 
 **ipset** хранит IP/подсети в хэш-таблице на уровне ядра. Проверка любого IP занимает одинаковое время независимо от размера списка.
 
-### Компоненты
-
-#### 1. ipset (ядро Linux)
-```bash
-# Создание набора для подсетей
-ipset create blacklist hash:net maxelem 131072
-
-# Добавление подсети
-ipset add blacklist 192.168.0.0/24
-
-# Проверка IP
-ipset test blacklist 192.168.0.1
-# Warning: 192.168.0.1 is in set blacklist.
-```
-
-#### 2. iptables (netfilter)
-```bash
-# Одно правило блокирует ВСЕ подсети из ipset
-iptables -A INPUT -m set --match-set blacklist src -j DROP
-```
-
-#### 3. UFW (надстройка над iptables)
-UFW управляет iptables через конфигурационные файлы:
-- `/etc/ufw/before.rules` — правила ДО пользовательских (сюда мы добавляем ipset)
-- `/etc/ufw/user.rules` — ваши правила (`ufw allow 22`)
-- `/etc/ufw/after.rules` — правила ПОСЛЕ пользовательских
-
-Скрипт добавляет правила ipset в `before.rules`, поэтому они обрабатываются **первыми**.
-
-### Порядок обработки правил
+### Порядок обработки правил (INPUT)
 
 ```
-1. ESTABLISHED,RELATED → ACCEPT
-   ↓ (если НЕ установленное соединение)
-2. Whitelist ipset → ACCEPT  
-   ↓ (если IP НЕ в whitelist)
-3. Blacklist ipset → DROP
-   ↓ (если IP НЕ в blacklist)
-4. Обычные UFW правила (ufw allow 22/tcp и т.д.)
+1. Whitelist ipset → ACCEPT (всегда пропускаем доверенные)
+   ↓
+2. Dangerous ipset → DROP (блок ДО проверки ESTABLISHED!)
+   ↓
+3. ESTABLISHED,RELATED → ACCEPT (ответы на НАШИ соединения)
+   ↓
+4. RU blacklist ipset → DROP (только новые входящие)
+   ↓
+5. UFW user rules (ufw allow 22/tcp и т.д.)
 ```
 
-**Важно:** правило `ESTABLISHED,RELATED` позволяет получать ответы на ваши исходящие соединения, даже если сервер находится в blacklist. Например, вы можете подключаться к API или скачивать файлы с заблокированных IP.
-
-### Источник blacklist:
-
-[C24Be/AS_Network_List](https://github.com/C24Be/AS_Network_List) — подсети российских государственных структур и связанных с ними сетей. Обновляется ежедневно.
+**Важно:** Dangerous блокируется ДО ESTABLISHED, поэтому даже если вы инициировали соединение к IP из dangerous списка, ответы будут заблокированы.
 
 ---
 
@@ -173,15 +146,15 @@ nano /usr/local/bin/ufw-blacklist.sh
 
 ---
 
-## Настройка Whitelist (опционально)
+## Настройка
 
-Если нужно добавить доверенные IP которые никогда не будут заблокированы, откройте скрипт:
+### Whitelist (рекомендуется!)
+
+Откройте скрипт и добавьте доверенные IP:
 
 ```bash
 nano /usr/local/bin/ufw-blacklist.sh
 ```
-
-Найдите секцию `WHITELIST_IPS` и добавьте свои IP:
 
 ```bash
 WHITELIST_IPS=(
@@ -189,6 +162,18 @@ WHITELIST_IPS=(
     "YOUR.OFFICE.IP.ADDRESS"    # IP офиса
     "YOUR.VPN.SERVER.IP"        # VPN сервер
 )
+```
+
+### Отключение отдельных списков
+
+Чтобы отключить RU blacklist, закомментируйте или очистите:
+```bash
+URL_RU=""
+```
+
+Чтобы отключить dangerous списки, очистите массив:
+```bash
+URLS_DANGEROUS=()
 ```
 
 ---
@@ -199,11 +184,9 @@ WHITELIST_IPS=(
 # Открыть crontab
 crontab -e
 
-# Добавить строку:
+# Добавить строку (запуск в 02:00 и 14:00):
 0 2,14 * * * /usr/local/bin/ufw-blacklist.sh >> /var/log/ufw_blacklist_cron.log 2>&1
 ```
-
-Это будет запускать скрипт в 02:00 и 14:00 каждый день.
 
 ---
 
@@ -213,24 +196,29 @@ crontab -e
 # Статистика ipset
 ipset list -t
 
-# Проверить конкретный IP в blacklist
-ipset test blacklist 1.2.3.4
+# Количество записей
+echo "Whitelist: $(ipset list whitelist 2>/dev/null | grep -c '^[0-9]')"
+echo "Dangerous: $(ipset list blacklist_dangerous 2>/dev/null | grep -c '^[0-9]')"
+echo "RU: $(ipset list blacklist_ru 2>/dev/null | grep -c '^[0-9]')"
 
-# Посмотреть правила в UFW
-grep -A5 "BEGIN IPSET" /etc/ufw/before.rules
+# Проверить конкретный IP
+ipset test blacklist_dangerous 1.2.3.4
+ipset test blacklist_ru 1.2.3.4
 
-# Посмотреть логи
+# Посмотреть правила iptables
+iptables -L ufw-before-input -v -n --line-numbers | head -15
+iptables -L ufw-before-output -v -n --line-numbers | head -10
+
+# Посмотреть правила в UFW before.rules
+grep -A15 "BEGIN IPSET" /etc/ufw/before.rules
+
+# Логи
 tail -f /var/log/ufw_blacklist.log
-
-# Количество заблокированных подсетей
-ipset list blacklist | grep -c "^[0-9]"
 ```
 
 ---
 
 ## Удаление
-
-Если нужно удалить скрипт и все правила:
 
 ```bash
 # 1. Удалить правила из UFW
@@ -240,7 +228,8 @@ sed -i '/# BEGIN IPSET BLACKLIST/,/# END IPSET BLACKLIST/d' /etc/ufw/before.rule
 ufw reload
 
 # 3. Удалить ipset наборы
-ipset destroy blacklist
+ipset destroy blacklist_dangerous
+ipset destroy blacklist_ru
 ipset destroy whitelist
 
 # 4. Удалить systemd сервис
@@ -249,6 +238,7 @@ rm /etc/systemd/system/ipset-load.service
 
 # 5. Удалить файлы
 rm /usr/local/bin/ufw-blacklist.sh
+rm /usr/local/bin/load-ipset-blacklist.sh
 rm /etc/ipset.rules
 rm /var/log/ufw_blacklist.log
 ```
@@ -263,16 +253,18 @@ rm /var/log/ufw_blacklist.log
 2. Выполните:
    ```bash
    ufw disable
-   ipset destroy blacklist
-   ipset destroy whitelist
+   ipset flush whitelist
+   ipset flush blacklist_dangerous
+   ipset flush blacklist_ru
    ```
 
 ### Заблокирован нужный IP
 
 ```bash
 # Проверить в каком списке IP
-ipset test blacklist X.X.X.X
 ipset test whitelist X.X.X.X
+ipset test blacklist_dangerous X.X.X.X
+ipset test blacklist_ru X.X.X.X
 
 # Добавить в whitelist
 ipset add whitelist X.X.X.X
@@ -289,6 +281,15 @@ systemctl status ipset-load.service
 
 # Включить если не включен
 systemctl enable ipset-load.service
+```
+
+### Нужно срочно отключить блокировку
+
+```bash
+# Временно (до перезагрузки UFW)
+iptables -D ufw-before-input -m set --match-set blacklist_dangerous src -j DROP
+iptables -D ufw-before-output -m set --match-set blacklist_dangerous dst -j DROP
+iptables -D ufw-before-input -m set --match-set blacklist_ru src -j DROP
 ```
 
 ---
