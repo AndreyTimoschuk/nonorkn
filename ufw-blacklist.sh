@@ -1,23 +1,16 @@
 #!/bin/bash
 
 # =============================================================================
-# UFW + IPSET Multi-Level Blacklist
-# https://github.com/AndreyTimoschuk/nonorkn
+# UFW + IPSET Blacklist - Многоуровневая блокировка сетей
 # =============================================================================
-# Two-level blocking:
-# 1. blacklist_dangerous - dangerous networks (botnets, malware, Tor, spam)
-#    → blocks EVERYTHING: incoming (src) + outgoing (dst) + ESTABLISHED
-# 2. blacklist_ru - Russian government networks (optional)
-#    → blocks only incoming, allows outgoing (for APIs, CDNs)
-# =============================================================================
-#
-# Sources:
-# - Dangerous lists: https://github.com/firehol/blocklist-ipsets
-# - RU list: https://github.com/C24Be/AS_Network_List
-#
+# Два уровня блокировки:
+# 1. blacklist_dangerous - опасные сети (ботнеты, малварь, Tor)
+#    → блокируем ВСЁ: входящие (src) + исходящие (dst) + ESTABLISHED
+# 2. blacklist_ru - российские госструктуры
+#    → блокируем только входящие, разрешаем исходящие (API, CDN)
 # =============================================================================
 
-# === QUICK DIAGNOSTICS ===
+# === БЫСТРАЯ ДИАГНОСТИКА ===
 # ipset list -t
 # echo "Whitelist: $(ipset list whitelist 2>/dev/null | grep -c '^[0-9]')"
 # echo "Dangerous: $(ipset list blacklist_dangerous 2>/dev/null | grep -c '^[0-9]')"
@@ -27,89 +20,121 @@
 # iptables -L ufw-before-output -v -n --line-numbers | head -10
 
 # =============================================================================
-# CONFIGURATION
+# КОНФИГУРАЦИЯ
 # =============================================================================
 
 LOG_FILE="/var/log/ufw_blacklist.log"
 IPSET_SAVE_FILE="/etc/ipset.rules"
 IPSET_LOAD_SCRIPT="/usr/local/bin/load-ipset-blacklist.sh"
 
-# ipset set names
+# Имена ipset наборов
 IPSET_WHITELIST="whitelist"
-IPSET_DANGEROUS="blacklist_dangerous"  # Dangerous - block ALL: INPUT + OUTPUT + ESTABLISHED
-IPSET_RU="blacklist_ru"                # Russian gov - block only INPUT
+IPSET_DANGEROUS="blacklist_dangerous"  # Опасные - блокируем ВСЁ: INPUT + OUTPUT + ESTABLISHED
+IPSET_RU="blacklist_ru"                # Российские - блокируем только INPUT
 
 # =============================================================================
-# LIST SOURCES
+# ИСТОЧНИКИ СПИСКОВ
 # =============================================================================
 
-# Russian government networks (block incoming, allow outgoing)
-# Comment out or set empty to disable
+# Российские госструктуры (блокируем входящие, разрешаем исходящие)
 URL_RU="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt"
 
-# Dangerous networks - block COMPLETELY (even ESTABLISHED)
-# Source: https://github.com/firehol/blocklist-ipsets
-# Comment out entries you don't need
+# Опасные сети - блокируем ПОЛНОСТЬЮ (даже ESTABLISHED)
+# Источник: https://github.com/firehol/blocklist-ipsets
 URLS_DANGEROUS=(
+    # === HIJACKED NETWORKS & SPAM ===
     # Spamhaus DROP - hijacked networks, professional spam/cybercrime
     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/spamhaus_drop.netset"
     # Spamhaus EDROP - extended DROP list
     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/spamhaus_edrop.netset"
-    # Blocklist.de - brute force attacks (SSH, FTP, etc) - last 48 hours
+    
+    # === MALWARE & C&C SERVERS (критично для VPN!) ===
+    # Feodo BadIPs - Zeus/Feodo C&C серверы
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/feodo_badips.ipset"
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/blocklist_net_ua.ipset"
+    # Zeus троян - C&C серверы
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/iblocklist_abuse_zeus.netset"
+    # SpyEye троян - C&C серверы
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/iblocklist_abuse_spyeye.netset"
+    # Palevo ботнет (Rimecud, Pilleuz)
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/iblocklist_abuse_palevo.netset"
+    # CyberCrime tracker - C&C серверы (botnets, trojans)
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/cybercrime.ipset"
+    # CryptoWall ransomware C&C
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/cta_cryptowall.ipset"
+    # EmergingThreats compromised hosts (заражённые машины)
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/et_compromised.ipset"
+    # Binary Defense - Artillery honeypot intelligence
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/bds_atif.ipset"
+
+    # === BRUTE-FORCE & SCANNERS ===
+    # Blocklist.de - brute force attacks (SSH, FTP, etc)
     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/blocklist_de.ipset"
-    # Feodo tracker - banking trojans (Emotet, Dridex, etc)
-    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/feodo.ipset"
-    # TOR exit nodes - anonymous traffic
-    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/tor_exits.ipset"
     # DShield - top 20 attacking subnets
     "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/dshield.netset"
+    # GreenSnow - port scanners, FTP/SSH brute force
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/greensnow.ipset"
+
+    # === REPUTATION LISTS ===
+    # CIArmy - IPs with poor reputation
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/ciarmy.ipset"
+    # Darklist.de - SSH fail2ban aggregated reports
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/darklist_de.netset"
+    
+    # === TOR - блокируем exit nodes ===
+    "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/tor_exits.ipset"
 )
 
 # =============================================================================
-# WHITELIST - IPs that should ALWAYS be allowed
-# Add your trusted IPs here (home IP, office, VPN servers, etc.)
+# WHITELIST - IP адреса которые ВСЕГДА должны быть разрешены
 # =============================================================================
 WHITELIST_IPS=(
-    # Example: "1.2.3.4"
-    # Example: "10.0.0.0/8"
+{% if iptables_whitelist_ips is defined %}
+{% for ip in iptables_whitelist_ips %}
+    "{{ ip }}"
+{% endfor %}
+{% endif %}
+    # Критичные IP для работы VPN/прокси
+    "95.142.206.1"
 )
 
+{% raw %}
 # =============================================================================
-# FUNCTIONS
+# ФУНКЦИИ
 # =============================================================================
 
-[[ $EUID -ne 0 ]] && { echo "Error: script must be run as root (sudo)" | tee -a "$LOG_FILE"; exit 1; }
+[[ $EUID -ne 0 ]] && { echo "Ошибка: скрипт должен запускаться от root" | tee -a "$LOG_FILE"; exit 1; }
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): $*" | tee -a "$LOG_FILE"
 }
 
 install_packages() {
-    log "Checking packages..."
+    log "Проверка пакетов..."
     if ! command -v ipset &> /dev/null; then
-        log "Installing ipset..."
+        log "Установка ipset..."
         apt-get update >> "$LOG_FILE" 2>&1
         apt-get install -y ipset >> "$LOG_FILE" 2>&1
     fi
 }
 
 create_ipsets() {
-    log "Creating ipset sets..."
+    log "Создание ipset наборов..."
     
     # Whitelist
     ipset create "$IPSET_WHITELIST" hash:net family inet hashsize 1024 maxelem 65536 2>/dev/null || true
     
-    # Dangerous - large set
-    ipset create "$IPSET_DANGEROUS" hash:net family inet hashsize 65536 maxelem 500000 2>/dev/null || true
+    # Dangerous - опасные сети (большой набор, ~100k записей)
+    ipset create "$IPSET_DANGEROUS" hash:net family inet hashsize 131072 maxelem 1000000 2>/dev/null || true
     
-    # Russian government networks
+    # Russian - российские госструктуры
     ipset create "$IPSET_RU" hash:net family inet hashsize 8192 maxelem 100000 2>/dev/null || true
     
-    log "ipset sets created"
+    log "ipset наборы созданы"
 }
 
 apply_whitelist() {
-    log "Loading whitelist..."
+    log "Загрузка whitelist..."
     
     ipset flush "$IPSET_WHITELIST" 2>/dev/null || true
     
@@ -119,21 +144,21 @@ apply_whitelist() {
         ipset add "$IPSET_WHITELIST" "$ip" 2>/dev/null && ((count++)) || true
     done
     
-    log "Whitelist: $count IPs"
+    log "Whitelist: $count IP"
 }
 
-# Load list into ipset
+# Загрузка списка в ipset
 load_list_to_ipset() {
     local url="$1"
     local ipset_name="$2"
     local temp_file="/tmp/blacklist_$(basename "$url")"
     
     if ! curl -sf --connect-timeout 10 --max-time 60 --retry 2 "$url" -o "$temp_file" 2>/dev/null; then
-        log "WARN: Failed to download $url"
+        log "WARN: Не удалось скачать $url"
         return 1
     fi
     
-    # Filter valid IPv4 subnets
+    # Фильтруем валидные IPv4 подсети
     grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "$temp_file" 2>/dev/null | while read -r subnet; do
         echo "add $ipset_name $subnet"
     done
@@ -142,10 +167,10 @@ load_list_to_ipset() {
 }
 
 apply_dangerous_blacklist() {
-    log "Loading DANGEROUS lists (blocking ALL including ESTABLISHED)..."
+    log "Загрузка ОПАСНЫХ списков (блокируем ВСЁ включая ESTABLISHED)..."
     
     if [[ ${#URLS_DANGEROUS[@]} -eq 0 ]]; then
-        log "WARN: URLS_DANGEROUS is empty - dangerous blocking disabled"
+        log "WARN: URLS_DANGEROUS пуст - dangerous блокировка отключена"
         return 0
     fi
     
@@ -155,28 +180,28 @@ apply_dangerous_blacklist() {
     > "$restore_file"
     
     for url in "${URLS_DANGEROUS[@]}"; do
-        log "  Downloading: $(basename "$url")"
+        log "  Скачивание: $(basename "$url")"
         load_list_to_ipset "$url" "$IPSET_DANGEROUS" >> "$restore_file"
     done
     
-    # Remove duplicates and load
+    # Удаляем дубликаты и загружаем
     sort -u "$restore_file" > "${restore_file}.sorted"
     local count=$(wc -l < "${restore_file}.sorted")
     
     if ipset restore -! < "${restore_file}.sorted" 2>> "$LOG_FILE"; then
-        log "Dangerous blacklist: $count subnets"
+        log "Dangerous blacklist: $count подсетей"
     else
-        log "WARN: Errors loading dangerous blacklist"
+        log "WARN: Ошибки при загрузке dangerous blacklist"
     fi
     
     rm -f "$restore_file" "${restore_file}.sorted"
 }
 
 apply_ru_blacklist() {
-    log "Loading RU list (blocking incoming, allowing outgoing)..."
+    log "Загрузка RU списка (блокируем входящие, разрешаем исходящие)..."
     
     if [[ -z "$URL_RU" ]]; then
-        log "WARN: URL_RU is empty - RU blocking disabled"
+        log "WARN: URL_RU пуст - RU блокировка отключена"
         return 0
     fi
     
@@ -185,7 +210,7 @@ apply_ru_blacklist() {
     local temp_file="/tmp/blacklist_ru.txt"
     
     if ! curl -sf --connect-timeout 10 --max-time 60 --retry 3 "$URL_RU" -o "$temp_file" 2>/dev/null; then
-        log "WARN: Failed to download RU list"
+        log "WARN: Не удалось скачать RU список"
         return 1
     fi
     
@@ -197,58 +222,58 @@ apply_ru_blacklist() {
     local count=$(wc -l < "$restore_file")
     
     if ipset restore -! < "$restore_file" 2>> "$LOG_FILE"; then
-        log "RU blacklist: $count subnets"
+        log "RU blacklist: $count подсетей"
     else
-        log "WARN: Errors loading RU blacklist"
+        log "WARN: Ошибки при загрузке RU blacklist"
     fi
     
     rm -f "$temp_file" "$restore_file"
 }
 
 integrate_with_ufw() {
-    log "Integrating with UFW..."
+    log "Интеграция с UFW..."
     
     local before_rules="/etc/ufw/before.rules"
     local marker_start="# BEGIN IPSET BLACKLIST"
     local marker_end="# END IPSET BLACKLIST"
     local tmp_rules="/tmp/ipset_ufw_rules.txt"
     
-    [[ ! -f "$before_rules" ]] && { log "ERROR: $before_rules not found"; return 1; }
+    [[ ! -f "$before_rules" ]] && { log "ERROR: $before_rules не найден"; return 1; }
     
-    # Remove old rules
+    # Удаляем старые правила
     if grep -q "$marker_start" "$before_rules"; then
         sed -i "/$marker_start/,/$marker_end/d" "$before_rules"
     fi
     
-    # IMPORTANT: Rule order is critical!
-    # 1. Whitelist - always allow
-    # 2. Dangerous - block ALL (BEFORE ESTABLISHED check!)
-    # 3. ESTABLISHED,RELATED - allow responses to our connections
-    # 4. RU blacklist - block only new incoming
+    # ВАЖНО: Порядок правил критичен!
+    # 1. Whitelist - всегда пропускаем
+    # 2. Dangerous - блокируем ВСЁ (ДО проверки ESTABLISHED!)
+    # 3. ESTABLISHED,RELATED - пропускаем ответы на наши соединения
+    # 4. RU blacklist - блокируем только новые входящие
     cat > "$tmp_rules" << EOF
 
 $marker_start
-# === WHITELIST - always allow trusted IPs ===
+# === WHITELIST - всегда разрешаем доверенные IP ===
 -A ufw-before-input -m set --match-set $IPSET_WHITELIST src -j ACCEPT
 -A ufw-before-output -m set --match-set $IPSET_WHITELIST dst -j ACCEPT
 
-# === DANGEROUS - block ALL (botnets, malware, Tor, spammers) ===
-# Incoming from dangerous IPs
+# === DANGEROUS - блокируем ВСЁ (ботнеты, малварь, Tor, спамеры) ===
+# Входящие от опасных IP
 -A ufw-before-input -m set --match-set $IPSET_DANGEROUS src -j DROP
-# Outgoing TO dangerous IPs (prevent server connecting to botnets/malware)
+# Исходящие К опасным IP (не даём серверу подключаться к ботнетам/малвари)
 -A ufw-before-output -m set --match-set $IPSET_DANGEROUS dst -j DROP
 
-# === ESTABLISHED/RELATED - allow responses to OUR connections ===
-# (only for IPs NOT in dangerous list - they're already blocked above)
+# === ESTABLISHED/RELATED - разрешаем ответы на НАШИ соединения ===
+# (только для IP которые НЕ в dangerous списке - они уже заблокированы выше)
 -A ufw-before-input -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-# === RU BLACKLIST - block only NEW incoming connections ===
-# Can make outgoing connections to these IPs (APIs, CDNs, etc)
+# === RU BLACKLIST - блокируем только НОВЫЕ входящие соединения ===
+# Можно делать исходящие соединения к этим IP (API, CDN, etc)
 -A ufw-before-input -m set --match-set $IPSET_RU src -j DROP
 $marker_end
 EOF
     
-    # Insert rules
+    # Вставляем правила
     if grep -q "# End required lines" "$before_rules"; then
         sed -i "/# End required lines/r $tmp_rules" "$before_rules"
     else
@@ -258,15 +283,15 @@ EOF
     rm -f "$tmp_rules"
     
     if grep -q "$marker_start" "$before_rules"; then
-        log "UFW integration successful"
+        log "UFW интеграция успешна"
     else
-        log "ERROR: UFW integration failed!"
+        log "ERROR: UFW интеграция не удалась!"
         return 1
     fi
 }
 
 save_ipset() {
-    log "Saving ipset..."
+    log "Сохранение ipset..."
     
     ipset save > "$IPSET_SAVE_FILE" 2>/dev/null
     
@@ -295,31 +320,31 @@ SERVICEEOF
     systemctl daemon-reload
     systemctl enable ipset-load.service >> "$LOG_FILE" 2>&1
     
-    log "Persistence configured"
+    log "Автозагрузка настроена"
 }
 
 reload_ufw() {
-    log "Reloading UFW..."
+    log "Перезагрузка UFW..."
     ufw reload >> "$LOG_FILE" 2>&1
 }
 
 show_stats() {
     echo ""
     echo "==========================================" | tee -a "$LOG_FILE"
-    echo "              STATISTICS                  " | tee -a "$LOG_FILE"
+    echo "              СТАТИСТИКА                  " | tee -a "$LOG_FILE"
     echo "==========================================" | tee -a "$LOG_FILE"
-    echo "Whitelist:                 $(ipset list "$IPSET_WHITELIST" 2>/dev/null | grep -c '^[0-9]' || echo 0) IPs" | tee -a "$LOG_FILE"
-    echo "Dangerous (IN+OUT block):  $(ipset list "$IPSET_DANGEROUS" 2>/dev/null | grep -c '^[0-9]' || echo 0) subnets" | tee -a "$LOG_FILE"
-    echo "RU (INPUT only block):     $(ipset list "$IPSET_RU" 2>/dev/null | grep -c '^[0-9]' || echo 0) subnets" | tee -a "$LOG_FILE"
+    echo "Whitelist:                 $(ipset list "$IPSET_WHITELIST" 2>/dev/null | grep -c '^[0-9]' || echo 0) IP" | tee -a "$LOG_FILE"
+    echo "Dangerous (IN+OUT блок):   $(ipset list "$IPSET_DANGEROUS" 2>/dev/null | grep -c '^[0-9]' || echo 0) подсетей" | tee -a "$LOG_FILE"
+    echo "RU (только INPUT блок):    $(ipset list "$IPSET_RU" 2>/dev/null | grep -c '^[0-9]' || echo 0) подсетей" | tee -a "$LOG_FILE"
     echo "==========================================" | tee -a "$LOG_FILE"
     echo ""
-    echo "Whitelist IPs:" | tee -a "$LOG_FILE"
+    echo "Whitelist IP:" | tee -a "$LOG_FILE"
     ipset list "$IPSET_WHITELIST" 2>/dev/null | grep '^[0-9]' | head -20 | tee -a "$LOG_FILE"
     echo ""
-    echo "UFW rules (INPUT):" | tee -a "$LOG_FILE"
+    echo "UFW правила (INPUT):" | tee -a "$LOG_FILE"
     iptables -L ufw-before-input -n --line-numbers 2>/dev/null | head -8 | tee -a "$LOG_FILE"
     echo ""
-    echo "UFW rules (OUTPUT):" | tee -a "$LOG_FILE"
+    echo "UFW правила (OUTPUT):" | tee -a "$LOG_FILE"
     iptables -L ufw-before-output -n --line-numbers 2>/dev/null | head -5 | tee -a "$LOG_FILE"
 }
 
@@ -328,17 +353,18 @@ show_stats() {
 # =============================================================================
 
 log "========================================"
-log "UFW + IPSET Multi-Blacklist started"
+log "UFW + IPSET Multi-Blacklist запущен"
 log "========================================"
 
 install_packages
 create_ipsets
 apply_whitelist
-apply_dangerous_blacklist    # First dangerous (block ALL)
-apply_ru_blacklist           # Then RU (block only incoming)
+apply_dangerous_blacklist    # Сначала опасные (блок ВСЁ)
+apply_ru_blacklist           # Потом RU (блок только входящие)
 integrate_with_ufw
 save_ipset
 reload_ufw
 show_stats
 
-log "Script completed successfully"
+log "Скрипт завершён успешно"
+{% endraw %}
